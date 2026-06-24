@@ -1,5 +1,5 @@
 // bot/index.js — YouTube → Discord Notifier (GitHub Actions)
-// • Premier lancement manuel (INIT_MODE=true) : indexe les vidéos existantes sans notifier
+// • Premier lancement manuel (INIT_MODE=true) : envoie les vidéos existantes + indexe
 // • Cron automatique : notifie uniquement les nouvelles vidéos
 
 const fetch  = require("node-fetch");
@@ -16,11 +16,11 @@ let CHANNELS = [];
 try {
   CHANNELS = JSON.parse(process.env.CHANNELS || "[]");
 } catch (e) {
-  console.error("❌ Secret CHANNELS invalide :", e.message);
+  console.error("CHANNELS invalide :", e.message);
   process.exit(1);
 }
-if (!WEBHOOK_URL) { console.error("❌ DISCORD_WEBHOOK manquant."); process.exit(1); }
-if (!CHANNELS.length) { console.error("❌ CHANNELS vide."); process.exit(1); }
+if (!WEBHOOK_URL) { console.error("DISCORD_WEBHOOK manquant."); process.exit(1); }
+if (!CHANNELS.length) { console.error("CHANNELS vide."); process.exit(1); }
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
 function loadSeen() {
@@ -72,15 +72,15 @@ function parseDuration(video) {
 
 // ─── Envoi Discord ────────────────────────────────────────────────────────────
 async function sendDiscord(video, channelConfig, short, duration) {
-  const videoId   = video["yt:videoId"];
-  const title     = video.title || "Nouvelle vidéo";
-  const videoUrl  = short
+  const videoId    = video["yt:videoId"];
+  const title      = video.title || "Nouvelle vidéo";
+  const videoUrl   = short
     ? `https://www.youtube.com/shorts/${videoId}`
     : `https://www.youtube.com/watch?v=${videoId}`;
-  const author    = video.author?.name || channelConfig.name;
+  const author     = video.author?.name || channelConfig.name;
   const channelUrl = `https://www.youtube.com/@${author.replace(/\s+/g, "")}`;
-  const rawDesc   = video["media:group"]?.["media:description"] || "";
-  const desc      = rawDesc.length > 280 ? rawDesc.slice(0, 280) + "…" : rawDesc;
+  const rawDesc    = video["media:group"]?.["media:description"] || "";
+  const desc       = rawDesc.length > 280 ? rawDesc.slice(0, 280) + "…" : rawDesc;
 
   const publishedStr = video.published
     ? new Date(video.published).toLocaleString("fr-FR", {
@@ -94,9 +94,9 @@ async function sendDiscord(video, channelConfig, short, duration) {
   const thumb = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
 
   const fields = [
-    { name: "📺 Chaîne",    value: `[${author}](${channelUrl})`, inline: true },
-    { name: "📅 Publiée le", value: publishedStr,                 inline: true },
-    { name: "🎞️ Type",      value: badge,                        inline: true },
+    { name: "📺 Chaîne",     value: `[${author}](${channelUrl})`, inline: true },
+    { name: "📅 Publiée le", value: publishedStr,                  inline: true },
+    { name: "🎞️ Type",       value: badge,                         inline: true },
   ];
   if (duration) fields.push({ name: "⏱️ Durée", value: duration, inline: true });
   fields.push({ name: "🔗 Regarder", value: `[Ouvrir sur YouTube](${videoUrl})`, inline: false });
@@ -131,50 +131,59 @@ async function checkChannel(channelConfig, seen) {
   try {
     entries = await fetchFeed(id);
   } catch (err) {
-    console.error(`  ⚠️  [${name}] RSS inaccessible : ${err.message}`);
+    console.error(`  [${name}] RSS inaccessible : ${err.message}`);
     return;
   }
-
   if (!entries.length) return;
 
-  // ── Mode init (premier run manuel) : on indexe tout sans envoyer ──
+  // ── Mode init : envoie toutes les vidéos existantes puis indexe ──
   if (INIT_MODE) {
+    console.log(`  [${name}] Init — envoi de ${entries.length} video(s)...`);
+    for (const video of [...entries].reverse()) {
+      const videoId = video["yt:videoId"];
+      if (!videoId) continue;
+      const title    = video.title || "";
+      const desc     = video["media:group"]?.["media:description"] || "";
+      const short    = await isShort(videoId, title, desc);
+      const duration = parseDuration(video);
+      try {
+        await sendDiscord(video, channelConfig, short, duration);
+        console.log(`  OK [${name}] "${title}"`);
+      } catch (err) {
+        console.error(`  ERR [${name}] ${err.message}`);
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
     seen[id] = entries.map(e => e["yt:videoId"]).filter(Boolean);
-    console.log(`  📋 [${name}] Init — ${seen[id].length} vidéo(s) indexée(s), aucune notification.`);
     return;
   }
 
-  // ── Si la chaîne n'est pas encore dans seen (ne devrait pas arriver après l'init) ──
+  // ── Cron : nouveautés seulement ──
   if (!seen[id]) {
     seen[id] = entries.map(e => e["yt:videoId"]).filter(Boolean);
-    console.log(`  📋 [${name}] Nouveau — ${seen[id].length} vidéo(s) indexée(s).`);
+    console.log(`  [${name}] Premiere fois — ${seen[id].length} video(s) indexee(s).`);
     return;
   }
 
   const newVideos = entries.filter(e => e["yt:videoId"] && !seen[id].includes(e["yt:videoId"]));
-
   if (!newVideos.length) {
-    console.log(`  ✔  [${name}] Rien de nouveau.`);
+    console.log(`  [${name}] Rien de nouveau.`);
     return;
   }
 
   for (const video of newVideos.reverse()) {
-    const videoId = video["yt:videoId"];
-    const title   = video.title || "";
-    const desc    = video["media:group"]?.["media:description"] || "";
-    console.log(`  🆕 [${name}] "${title}"`);
-
+    const videoId  = video["yt:videoId"];
+    const title    = video.title || "";
+    const desc     = video["media:group"]?.["media:description"] || "";
     const short    = await isShort(videoId, title, desc);
     const duration = parseDuration(video);
-    console.log(`     ${short ? "⚡ Short" : "🎬 Vidéo"}${duration ? " • " + duration : ""}`);
-
+    console.log(`  NEW [${name}] "${title}" ${short ? "Short" : "Video"}`);
     try {
       await sendDiscord(video, channelConfig, short, duration);
-      console.log(`  ✅ Notification envoyée.`);
+      console.log(`  OK notification envoyee.`);
     } catch (err) {
-      console.error(`  ❌ Échec : ${err.message}`);
+      console.error(`  ERR ${err.message}`);
     }
-
     seen[id].push(videoId);
     if (seen[id].length > 50) seen[id] = seen[id].slice(-50);
     await new Promise(r => setTimeout(r, 2000));
@@ -183,14 +192,13 @@ async function checkChannel(channelConfig, seen) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 (async () => {
-  const mode = INIT_MODE ? "🗂️  INIT (indexation silencieuse)" : "🔔 SURVEILLANCE";
-  console.log(`🤖 YT Notifier — ${mode}`);
-  console.log(`📅 ${new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" })}`);
-  console.log(`📺 ${CHANNELS.map(c => c.name).join(", ")}\n`);
+  const mode = INIT_MODE ? "INIT (envoi + indexation)" : "SURVEILLANCE";
+  console.log(`YT Notifier — ${mode}`);
+  console.log(`${new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" })}`);
+  console.log(`Chaines : ${CHANNELS.map(c => c.name).join(", ")}\n`);
 
   const seen = loadSeen();
   for (const ch of CHANNELS) await checkChannel(ch, seen);
   saveSeen(seen);
-
-  console.log("\n✅ Terminé.");
+  console.log("\nTermine.");
 })();

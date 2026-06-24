@@ -16,10 +16,10 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 🟢 Node.js 20
+      - name: 🟢 Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: 📦 Dépendances
         run: npm install
@@ -30,14 +30,15 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           CHANNELS: ${{ secrets.CHANNELS }}
           MENTION: ${{ secrets.MENTION }}
-          # En déclenchement manuel → mode init : on indexe sans notifier
           INIT_MODE: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: node bot/index.js
+
+      - name: 📄 Contenu seen_videos après run
+        run: cat bot/seen_videos.json
 
       - name: 💾 Commit seen_videos.json
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add bot/seen_videos.json
-          git diff --cached --quiet || git commit -m "chore: update seen_videos [skip ci]"
-          git push
+          git diff --cached --quiet && echo "✔ Rien à commiter" || (git commit -m "chore: update seen_videos [skip ci]" && git push && echo "✅ Commité et pushé")
