@@ -1,5 +1,5 @@
 // bot/index.js — YouTube → Discord Notifier (GitHub Actions)
-// • Premier lancement manuel (INIT_MODE=true) : envoie les vidéos existantes + indexe
+// • Run manuel (INIT_MODE=true) : envoie les 10 dernières vidéos de chaque chaîne
 // • Cron automatique : notifie uniquement les nouvelles vidéos
 
 const fetch  = require("node-fetch");
@@ -35,7 +35,7 @@ function saveSeen(seen) {
 async function fetchFeed(channelId) {
   const res = await fetch(
     `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`,
-    { headers: { "User-Agent": "Mozilla/5.0 (compatible; YT-Discord-Bot/2.1)" }, timeout: 15000 }
+    { headers: { "User-Agent": "Mozilla/5.0 (compatible; YT-Discord-Bot/2.2)" }, timeout: 15000 }
   );
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const parsed = await xml2js.parseStringPromise(await res.text(), { explicitArray: false });
@@ -124,7 +124,30 @@ async function sendDiscord(video, channelConfig, short, duration) {
   if (!res.ok) throw new Error(`Discord ${res.status}: ${await res.text()}`);
 }
 
-// ─── Vérification d'une chaîne ────────────────────────────────────────────────
+// ─── Envoi des N dernières vidéos d'une chaîne (mode init) ───────────────────
+async function sendLatest(channelConfig, entries, n) {
+  // entries est trié du plus récent au plus ancien, on prend les n premiers
+  // et on les envoie du plus ancien au plus récent pour un ordre chronologique
+  const toSend = entries.slice(0, n).reverse();
+  console.log(`  [${channelConfig.name}] Envoi des ${toSend.length} dernières vidéos...`);
+  for (const video of toSend) {
+    const videoId  = video["yt:videoId"];
+    if (!videoId) continue;
+    const title    = video.title || "";
+    const desc     = video["media:group"]?.["media:description"] || "";
+    const short    = await isShort(videoId, title, desc);
+    const duration = parseDuration(video);
+    try {
+      await sendDiscord(video, channelConfig, short, duration);
+      console.log(`  OK "${title}"`);
+    } catch (err) {
+      console.error(`  ERR ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, 2000)); // anti rate-limit Discord
+  }
+}
+
+// ─── Vérification d'une chaîne (mode cron) ───────────────────────────────────
 async function checkChannel(channelConfig, seen) {
   const { id, name } = channelConfig;
   let entries;
@@ -136,29 +159,6 @@ async function checkChannel(channelConfig, seen) {
   }
   if (!entries.length) return;
 
-  // ── Mode init : envoie toutes les vidéos existantes puis indexe ──
-  if (INIT_MODE) {
-    console.log(`  [${name}] Init — envoi de ${entries.length} video(s)...`);
-    for (const video of [...entries].reverse()) {
-      const videoId = video["yt:videoId"];
-      if (!videoId) continue;
-      const title    = video.title || "";
-      const desc     = video["media:group"]?.["media:description"] || "";
-      const short    = await isShort(videoId, title, desc);
-      const duration = parseDuration(video);
-      try {
-        await sendDiscord(video, channelConfig, short, duration);
-        console.log(`  OK [${name}] "${title}"`);
-      } catch (err) {
-        console.error(`  ERR [${name}] ${err.message}`);
-      }
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    seen[id] = entries.map(e => e["yt:videoId"]).filter(Boolean);
-    return;
-  }
-
-  // ── Cron : nouveautés seulement ──
   if (!seen[id]) {
     seen[id] = entries.map(e => e["yt:videoId"]).filter(Boolean);
     console.log(`  [${name}] Premiere fois — ${seen[id].length} video(s) indexee(s).`);
@@ -192,13 +192,39 @@ async function checkChannel(channelConfig, seen) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 (async () => {
-  const mode = INIT_MODE ? "INIT (envoi + indexation)" : "SURVEILLANCE";
+  const mode = INIT_MODE ? "INIT (10 dernieres par chaine)" : "SURVEILLANCE";
   console.log(`YT Notifier — ${mode}`);
-  console.log(`${new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" })}`);
-  console.log(`Chaines : ${CHANNELS.map(c => c.name).join(", ")}\n`);
+  console.log(`${new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" })}\n`);
 
-  const seen = loadSeen();
-  for (const ch of CHANNELS) await checkChannel(ch, seen);
-  saveSeen(seen);
-  console.log("\nTermine.");
+  if (INIT_MODE) {
+    // Mode init : envoie les 10 dernières vidéos non encore vues, puis met à jour seen_videos.json
+    // → un 2ème run manuel ne renverra pas les mêmes vidéos
+    const seen = loadSeen();
+    for (const ch of CHANNELS) {
+      let entries;
+      try { entries = await fetchFeed(ch.id); }
+      catch (err) { console.error(`[${ch.name}] RSS inaccessible : ${err.message}`); continue; }
+
+      // Filtre les vidéos déjà vues (si seen_videos.json existe déjà)
+      const alreadySeen = seen[ch.id] || [];
+      const toSend = entries.filter(e => e["yt:videoId"] && !alreadySeen.includes(e["yt:videoId"]));
+
+      if (!toSend.length) {
+        console.log(`  [${ch.name}] Deja a jour, rien a envoyer.`);
+      } else {
+        await sendLatest(ch, toSend.slice(0, 10), 10);
+      }
+
+      // On indexe toutes les vidéos du flux pour éviter tout renvoi futur
+      seen[ch.id] = entries.map(e => e["yt:videoId"]).filter(Boolean);
+    }
+    saveSeen(seen);
+    console.log("\nInit terminee — seen_videos.json mis a jour.");
+  } else {
+    // Mode cron normal
+    const seen = loadSeen();
+    for (const ch of CHANNELS) await checkChannel(ch, seen);
+    saveSeen(seen);
+    console.log("\nTermine.");
+  }
 })();
